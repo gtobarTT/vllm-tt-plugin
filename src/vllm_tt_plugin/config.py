@@ -673,6 +673,23 @@ def get_tt_max_prefill_requests_per_step(vllm_config: "VllmConfig") -> int | Non
     return _read_tt_positive_int(tt_config, _MAX_PREFILL_REQUESTS_PER_STEP_KEY, 1)
 
 
+_FLUSH_PREFILL_OUTPUT_KEY = "flush_prefill_output"
+
+
+def get_tt_flush_prefill_output(vllm_config: "VllmConfig") -> bool:
+    """Whether a queued prefill step's output is published before the next step.
+
+    Under async scheduling vLLM publishes a step's tokens only after it has
+    submitted the next step, and a TT prefill submit runs the whole prefill
+    before returning. A prefill's first tokens therefore wait for the following
+    step, a whole second prefill when two prefill steps run back to back.
+    ``True`` publishes them first; decode steps keep their overlap. See
+    ``_install_tt_prefill_output_flush_patch`` in ``platform.py``. Default
+    ``False``.
+    """
+    return _read_tt_bool(get_tt_config(vllm_config), _FLUSH_PREFILL_OUTPUT_KEY, False)
+
+
 _LANE_PREFIX_CACHE_ROUTING_KEY = "lane_prefix_cache_routing"
 _LANE_PREFIX_CACHE_ROUTING_DEFAULT = True
 

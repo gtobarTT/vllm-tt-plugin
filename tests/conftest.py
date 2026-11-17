@@ -62,6 +62,10 @@ def reset_tt_platform_class_state():
     saved_original_pause_scheduler = engine_core.__dict__.get(
         "_tt_original_pause_scheduler", unset
     )
+    saved_step_with_batch_queue = engine_core.EngineCore.step_with_batch_queue
+    saved_original_step_with_batch_queue = engine_core.__dict__.get(
+        "_tt_original_step_with_batch_queue", unset
+    )
     # The DP routing patch wraps one method the load-balancing client defines
     # and one it inherits, so each is restored to its own class dict state.
     dp_client = core_client.DPLBAsyncMPClient
@@ -112,6 +116,13 @@ def reset_tt_platform_class_state():
         engine_core.__dict__.pop("_tt_original_pause_scheduler", None)
     else:
         engine_core._tt_original_pause_scheduler = saved_original_pause_scheduler
+    engine_core.EngineCore.step_with_batch_queue = saved_step_with_batch_queue
+    if saved_original_step_with_batch_queue is unset:
+        engine_core.__dict__.pop("_tt_original_step_with_batch_queue", None)
+    else:
+        engine_core._tt_original_step_with_batch_queue = (
+            saved_original_step_with_batch_queue
+        )
 
     async_llm.AsyncLLM._add_streaming_input_request = saved_add_streaming_input_request
     if saved_original_add_streaming_input_request is unset:

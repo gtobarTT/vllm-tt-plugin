@@ -21,6 +21,7 @@ from vllm_tt_plugin.config import (
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_decode_interleave_config,
+    get_tt_flush_prefill_output,
     get_tt_max_batch_size,
     get_tt_max_prefill_requests_per_step,
     get_tt_output_tokens_per_step,
@@ -245,6 +246,17 @@ def _validate_and_log_prefill_admission_cap(vllm_config: "VllmConfig") -> None:
             "request(s) across all lanes, oldest first.",
             cap,
         )
+
+
+def _install_prefill_output_flush_if_requested(vllm_config: "VllmConfig") -> None:
+    """Validate ``flush_prefill_output`` here; install the engine patch when on."""
+    if not get_tt_flush_prefill_output(vllm_config):
+        return
+    _install_tt_prefill_output_flush_patch()
+    logger.info(
+        "Prefill output flush: a prefill step's tokens are published before "
+        "the next step is scheduled (takes effect under async scheduling)."
+    )
 
 
 def _apply_chunked_prefill_policy(
@@ -1301,6 +1313,98 @@ def _install_block_output_pause_guard_patch() -> None:
         cls.pause_scheduler = _wrap(original)
 
 
+# The ``EngineCore`` members ``_publish_oldest_queued_step`` uses, taken from the
+# blocking half of vLLM's ``step_with_batch_queue`` it mirrors.
+_ENGINE_CORE_FLUSH_MEMBERS = (
+    "step_with_batch_queue",
+    "capture_iteration_details",
+    "log_error_detail",
+    "_process_aborts_queue",
+    "_attach_iteration_details",
+)
+
+
+def _publish_oldest_queued_step(engine) -> dict:
+    """Pop the oldest batch-queue entry, process its output, return its outputs.
+
+    The same sequence as the blocking half of vLLM's ``step_with_batch_queue``
+    (vllm/v1/engine/core.py, 0.31): wait on the sample future, process queued
+    aborts, then ``update_from_output``, which publishes the step's tokens.
+    """
+    future, scheduler_output, exec_future = engine.batch_queue.pop()
+    with (
+        engine.capture_iteration_details(scheduler_output) as iteration_details,
+        engine.log_error_detail(scheduler_output),
+    ):
+        model_output = future.result()
+        if model_output is None:
+            # As upstream: a None sample result means execute_model failed.
+            exec_future.result()
+            raise RuntimeError(
+                "TT prefill flush: the queued prefill step's sample future "
+                "returned None and its execute future raised nothing "
+                f"(scheduled requests: {sorted(scheduler_output.num_scheduled_tokens)})"
+            )
+    engine._process_aborts_queue()
+    outputs = engine.scheduler.update_from_output(scheduler_output, model_output)
+    engine._attach_iteration_details(outputs, iteration_details)
+    return outputs
+
+
+def _install_tt_prefill_output_flush_patch() -> None:
+    """Publish a queued TT prefill step's tokens before the next step is scheduled.
+
+    Under async scheduling ``EngineCore.step_with_batch_queue`` holds up to two
+    steps. It queues a newly scheduled step and returns at once while the queue
+    has room, so a step's tokens reach ``update_from_output`` only after the
+    next step has been scheduled and submitted. A TT prefill submit runs the
+    whole prefill before it returns, so when two prefill steps run back to back
+    the first step's tokens wait for the whole second prefill.
+
+    With ``flush_prefill_output`` on, a call that finds a prefill step
+    (``is_tt_prefill_step``) waiting in the queue publishes it and returns
+    without scheduling; the next call schedules as usual. Each call starts
+    with at most one queued step (upstream asserts the queue is not full), so
+    that step is the only one held back. A queued decode step is left to
+    upstream, so decode keeps its one-step overlap. The flush call reports
+    ``model_executed=True``: a step did run and its output is what the call
+    returns, and ``False`` would make a standard-DP engine run a dummy batch.
+
+    Installed only when the key is on; the wrapper reads the key per engine.
+    """
+    import vllm.v1.engine.core as engine_core
+
+    from vllm_tt_plugin.scheduler import is_tt_prefill_step
+
+    if hasattr(engine_core, "_tt_original_step_with_batch_queue"):
+        return
+    missing = [
+        name
+        for name in _ENGINE_CORE_FLUSH_MEMBERS
+        if not hasattr(engine_core.EngineCore, name)
+    ]
+    if missing:
+        raise RuntimeError(
+            "additional_config['tt']['flush_prefill_output'] needs EngineCore "
+            f"members {missing} that this vLLM does not have; update "
+            "_install_tt_prefill_output_flush_patch to the new engine loop."
+        )
+
+    original = engine_core.EngineCore.step_with_batch_queue
+    engine_core._tt_original_step_with_batch_queue = original
+
+    def step_with_batch_queue_tt(self):
+        flush = self.__dict__.get("_tt_flush_prefill_output")
+        if flush is None:
+            flush = get_tt_flush_prefill_output(self.vllm_config)
+            self._tt_flush_prefill_output = flush
+        if flush and self.batch_queue and is_tt_prefill_step(self.batch_queue[-1][1]):
+            return _publish_oldest_queued_step(self), True
+        return original(self)
+
+    engine_core.EngineCore.step_with_batch_queue = step_with_batch_queue_tt
+
+
 def _iter_extra_model_bundles():
     """Yield ``(folder, arch, main_class)`` for each bundle under ``EXTRA_MODELS_DIR``.
 
@@ -2059,6 +2163,7 @@ class TTPlatform(Platform):
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
         _validate_and_log_decode_interleave_policy(vllm_config)
         _validate_and_log_prefill_admission_cap(vllm_config)
+        _install_prefill_output_flush_if_requested(vllm_config)
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
         if output_tokens_per_step > 1 and seeded_sampling_policy == "host":
             raise ValueError(

@@ -91,6 +91,12 @@ def get_tt_block_step_decisions(
 # The lane coordinator's per-step state; see ``lane_scheduler.py``.
 _TT_STEP_STATE_ATTR = "_tt_step_state"
 
+# Which side of the prefill/decode split a step ran on. Set on every step a TT
+# scheduler returns (the lane coordinator sets it on the merged step), so code
+# holding only the ``SchedulerOutput``, such as the engine's batch queue, can
+# tell a prefill step from a decode step. Read by ``is_tt_prefill_step``.
+_TT_PREFILL_STEP_ATTR = "_tt_prefill_step"
+
 # Every attribute TT attaches to a ``SchedulerOutput`` beside its dataclass fields.
 # Code that rebuilds a ``SchedulerOutput`` from those fields alone drops these, and
 # carries them over with ``carry_tt_scheduler_output_fields``.
@@ -99,6 +105,7 @@ TT_SCHEDULER_OUTPUT_FIELDS = (
     _TT_OUTPUT_FRAME_REQ_IDS_ATTR,
     _TT_BLOCK_STEP_DECISIONS_ATTR,
     _TT_STEP_STATE_ATTR,
+    _TT_PREFILL_STEP_ATTR,
 )
 
 
@@ -112,6 +119,23 @@ def set_tt_scheduler_output_field(
             f"{TT_SCHEDULER_OUTPUT_FIELDS}"
         )
     setattr(scheduler_output, name, value)
+
+
+def set_tt_prefill_step(scheduler_output: SchedulerOutput, is_prefill: bool) -> None:
+    set_tt_scheduler_output_field(scheduler_output, _TT_PREFILL_STEP_ATTR, is_prefill)
+
+
+def is_tt_prefill_step(scheduler_output: SchedulerOutput) -> bool:
+    """Whether a TT scheduler returned this as a prefill step that runs tokens.
+
+    A prefill step (new prompts, resumed requests, chunk continuations) never
+    carries decode rows. ``False`` for a decode step, an empty step, and an
+    output no TT scheduler marked.
+    """
+    return (
+        getattr(scheduler_output, _TT_PREFILL_STEP_ATTR, False)
+        and scheduler_output.total_num_scheduled_tokens > 0
+    )
 
 
 def carry_tt_scheduler_output_fields(
@@ -963,6 +987,7 @@ class TTScheduler(AsyncScheduler):
     def _finalize_scheduler_output(
         self, scheduler_output: SchedulerOutput, *, is_decode: bool
     ) -> SchedulerOutput:
+        set_tt_prefill_step(scheduler_output, not is_decode)
         if is_decode:
             rows = len(scheduler_output.num_scheduled_tokens)
             if rows > getattr(self, "_widest_decode_batch_size", 0):

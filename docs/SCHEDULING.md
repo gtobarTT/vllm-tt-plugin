@@ -380,6 +380,44 @@ which prompts finish changes.
 
 Example: `--additional-config '{"tt": {"max_prefill_requests_per_step": 1}}'`.
 
+### Prefill output flush
+
+Under async scheduling vLLM's `EngineCore.step_with_batch_queue` keeps a batch
+queue of two steps. Each entry is `(sample future, SchedulerOutput, execute
+future)`. A call schedules a step, submits it, and queues it. While the queue
+has room, the call returns without processing any output. A step's tokens
+therefore reach `update_from_output`, which publishes them, only after the
+next step has been scheduled and submitted. A decode submit returns once the
+trace is enqueued, so this costs a decode token almost nothing and buys the
+host/device overlap. A prefill submit runs the whole prefill before it
+returns. When two prefill steps run back to back, the first step's first
+tokens wait for the whole second prefill. The admission cap above makes such
+runs common, because it splits a burst into one prefill step per prompt.
+
+`flush_prefill_output` (under `additional_config["tt"]`, boolean, default
+`false`) publishes a prefill step's tokens before the next step is scheduled:
+
+- Each scheduled step carries its kind. `TTScheduler` and, in lane mode,
+  `TTLaneCoordinator` mark every step they return as prefill or decode
+  (`is_tt_prefill_step`). A step that schedules no tokens is not a prefill
+  step.
+- A call to `step_with_batch_queue` starts with at most one queued step. If
+  that step is a prefill step, the call pops it, processes its output, and
+  returns its tokens without scheduling. The next call schedules as usual.
+  This covers both orders: a prefill queued alone, and a prefill submitted
+  behind an in-flight decode (that decode is published by vLLM's own pop when
+  the prefill is submitted).
+- A queued decode step is left to vLLM, so decode steps keep their one-step
+  overlap. No decode step is added, unlike `decode_interleave_prefill_steps: 1`.
+- The flush call reports `model_executed=True`. A standard-DP engine would run
+  a dummy batch on `False`.
+
+With the key absent or `false`, the engine patch is not installed. The
+setting does nothing without async scheduling, because only the batch-queue
+step function holds outputs back.
+
+Example: `--additional-config '{"tt": {"flush_prefill_output": true}}'`.
+
 ### Generic speculative decoding
 
 The generic speculative path uses `speculative_config` and a model's

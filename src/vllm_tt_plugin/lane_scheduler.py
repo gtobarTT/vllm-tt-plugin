@@ -59,6 +59,7 @@ from vllm_tt_plugin.scheduler import (
     TTSchedulingMode,
     get_tt_forced_reset_discard_counts,
     set_tt_forced_reset_discard_counts,
+    set_tt_prefill_step,
     set_tt_scheduler_output_field,
 )
 
@@ -789,6 +790,7 @@ class TTLaneCoordinator(SchedulerInterface):
         )
         plan = self._build_step_plan(lane_outputs, merged, is_decode)
         _set_tt_step_state(merged, _LaneStepState(lane_outputs=lane_outputs, plan=plan))
+        set_tt_prefill_step(merged, not is_decode)
         return merged
 
     def get_grammar_bitmask(
