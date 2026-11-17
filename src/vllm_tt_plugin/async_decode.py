@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections import Counter
@@ -26,6 +27,23 @@ from vllm_tt_plugin.spec_decode import (
 )
 from vllm_tt_plugin.stage_outputs import TTStageFrame, pop_tt_stage_outputs
 from vllm_tt_plugin.structured_output import has_structured_outputs
+
+# EXPERIMENTAL switches, opt-in, approved for one tt-ops experiment. Unset keeps
+# upstream behaviour.
+# TT_PLUGIN_EXP_KEEP_CHAIN=1: a lane decode step whose only layout change is
+# freed slots keeps the device-resident token chain (no input reload, no
+# pipeline drain), and a reloading decode step may be overlapped by the next
+# steady step.
+_EXP_KEEP_CHAIN = os.environ.get("TT_PLUGIN_EXP_KEEP_CHAIN", "0") == "1"
+# A freed slot that keeps the resident chain keeps advancing its position on
+# the device; force a reload before it gets this close to the position limit.
+_EXP_FREED_POS_MARGIN = 128
+# A freed slot that keeps the resident chain also keeps costing decode work
+# (its attention still runs over its old context) until the next input reload.
+# A prefill reloads anyway; when none comes, force the reload this many steps
+# after the first unreloaded release. hostdec1b (uncapped) slowed the
+# ramp-down steps ~1.4 ms while finished slots stayed resident.
+_EXP_FREED_MAX_STEPS = 32
 
 
 def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch.Tensor:
@@ -399,6 +417,17 @@ class TTAsyncDecodeController:
         # count the scheduler's lookahead reservation rather than a verify.
         self._ordinary_decode_submissions = 0
         self._verify_submissions = 0
+        # Experimental counters and state (see _EXP_KEEP_CHAIN).
+        self._exp_release_keeps = 0
+        self._exp_reload_overlaps = 0
+        # Steps a freed-but-resident slot may still advance before its device
+        # position nears the limit; None while no such slot exists.
+        self._exp_freed_budget: int | None = None
+        # Finished requests released without a drain. A step submitted before
+        # the release can still carry a late output for them, applied after
+        # the step whose finished_req_ids named them, so they stay suppressed
+        # until no step from before the release can still be applied.
+        self._exp_released_req_ids: dict[str, None] = {}
 
     @staticmethod
     def _clone_page_tables(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
@@ -501,6 +530,11 @@ class TTAsyncDecodeController:
         self._previous_device_sampling = model_input.perform_device_sampling
         self._previous_submission_verified = model_input.spec_mode is not None
         self._previous_submission_host_answered = host_answered
+        if reload_plan.reload_inputs:
+            # Host positions are authoritative again: freed slots are at -1.
+            self._exp_freed_budget = None
+        elif self._exp_freed_budget is not None:
+            self._exp_freed_budget -= 1
         if (
             reload_plan.reload_inputs
             or reload_plan.reload_page_table
@@ -778,6 +812,14 @@ class TTAsyncDecodeController:
                 self._verify_submissions,
                 self._overlapped_submissions,
             )
+            if _EXP_KEEP_CHAIN:
+                logger.info(
+                    "TT exp: releases kept resident %d, reload steps "
+                    "marked overlap-ok %d, unsafe overlaps %d",
+                    self._exp_release_keeps,
+                    self._exp_reload_overlaps,
+                    self._overlapped_unsafe_submissions,
+                )
 
     def _log_overlap_counters(self, *, force: bool = False) -> None:
         """Report the overlap counters, rarely enough to be readable.
@@ -860,6 +902,14 @@ class TTAsyncDecodeController:
         self.prune_finished_async_events()
         completed_steps = self.drain_completed_decode_steps()
         suppressed = set(suppress_output_req_ids or ())
+        if self._exp_released_req_ids:
+            suppressed.update(self._exp_released_req_ids)
+            with self.runner._steady_decode_lock:
+                idle = not self.runner._pending_async_steps
+            if idle:
+                # Every step from before those releases is in completed_steps
+                # (completions are enqueued before their event is set).
+                self._exp_released_req_ids.clear()
         discard_counts = forced_reset_discard_counts or {}
 
         # Results are ordered from oldest to newest. vLLM accepted the older
@@ -1280,10 +1330,102 @@ class TTAsyncDecodeController:
         )
         # Refused for a host-answered step as in ``submit_async_decode``, and
         # classified by the eligibility it was built with, as there.
+        overlap_ok = steady
+        if not steady and self._exp_reload_step_overlap_ok(model_input):
+            # Experimental: a plain device-sampled decode that reloaded its
+            # inputs leaves the same resident chain a steady step does, so the
+            # next step may overlap it when that step is itself steady
+            # (``must_drain_pending_async_steps`` checks the candidate).
+            overlap_ok = True
+            self._exp_reload_overlaps += 1
         self.register_pending_async_step(
-            step, steady=steady, overlap_ok=steady and not submission.host_answered
+            step,
+            steady=steady,
+            overlap_ok=overlap_ok and not submission.host_answered,
         )
         return step
+
+    @staticmethod
+    def _exp_reload_step_overlap_ok(model_input: TTModelInput) -> bool:
+        if not _EXP_KEEP_CHAIN:
+            return False
+        return (
+            model_input.spec_mode is None
+            and bool(model_input.perform_device_sampling)
+            and not getattr(model_input, "defer_device_sampling", False)
+            and model_input.max_num_logprobs[0] is None
+        )
+
+    def exp_release_keeps_chain(
+        self, scheduler_output: SchedulerOutput, plan: Any
+    ) -> bool:
+        """Whether a lane decode step whose layout change only frees slots can
+        keep the device-resident chain (experimental, TT_PLUGIN_EXP_KEEP_CHAIN).
+
+        Called before ``apply_step_plan`` mutates the batch. The surviving
+        slots keep their stable rows and their resident tokens and positions,
+        so nothing has to be reloaded and the pipeline need not drain. A freed
+        slot keeps decoding on the device until the next input reload: its
+        page-table row is zeroed by the same step (``_page_tables_changed``
+        uploads the table), so its writes land in the null block,
+        and its output is never read (it is not a scheduled row). Its position
+        keeps advancing and its attention keeps costing device time, so
+        ``_exp_freed_budget`` bounds the steps until the next reload (at most
+        ``_EXP_FREED_MAX_STEPS``, less near the position limit).
+        """
+        if not _EXP_KEEP_CHAIN or not plan.is_decode or not plan.decode_layout_changed:
+            return False
+        runner = self.runner
+        if (
+            not self._decode_chain_valid
+            or self._previous_device_sampling is not True
+            or runner._decode_layout_changed_since_last_decode
+            or self.decode_input_update_contract_version() < 1
+        ):
+            return False
+        if (
+            scheduler_output.scheduled_new_reqs
+            or scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        ):
+            return False
+        lane_batch = runner.lane_batch
+        index = lane_batch.req_id_to_index
+        if any(req_id not in index for req_id in plan.scheduled_req_ids):
+            return False
+        # Preemption keeps its in-flight token valid (it must be published and
+        # applied), so only finished requests take this path.
+        if any(req_id in index for req_id in scheduler_output.preempted_req_ids or ()):
+            return False
+        released_ids = [r for r in scheduler_output.finished_req_ids if r in index]
+        released = [index[r] for r in released_ids]
+        if not released:
+            return False
+        block_size = int(runner.cache_config.block_size)
+        limit = min(
+            int(runner.max_num_blocks_per_req) * block_size,
+            int(runner.model_config.max_model_len),
+        )
+        max_pos = max(int(lane_batch.num_tokens[row]) for row in released) + 4
+        budget = min(limit - _EXP_FREED_POS_MARGIN - max_pos, _EXP_FREED_MAX_STEPS)
+        if budget <= 0:
+            return False
+        if self._exp_freed_budget is not None:
+            budget = min(budget, self._exp_freed_budget)
+            if budget <= 0:
+                return False
+        self._exp_freed_budget = budget
+        self._exp_release_keeps += 1
+        for req_id in released_ids:
+            self._exp_released_req_ids[req_id] = None
+        if len(self._exp_released_req_ids) > 4096:
+            # Bounded: drop the oldest; any step that could still carry them
+            # was applied thousands of steps ago.
+            for req_id in list(self._exp_released_req_ids)[:2048]:
+                del self._exp_released_req_ids[req_id]
+        return True
+
+    def exp_freed_budget_exhausted(self) -> bool:
+        return self._exp_freed_budget is not None and self._exp_freed_budget <= 1
 
     def submit_decode(
         self,

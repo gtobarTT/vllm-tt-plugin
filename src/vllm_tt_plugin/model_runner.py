@@ -2929,10 +2929,19 @@ class TTModelRunner:
             )
 
         lane_batch = self.lane_batch
+        # Experimental (TT_PLUGIN_EXP_KEEP_CHAIN): a decode step that only
+        # frees slots keeps the resident chain; see exp_release_keeps_chain.
+        if self.async_decode.exp_freed_budget_exhausted():
+            self._decode_layout_changed_since_last_decode = True
+        release_keeps_chain = self.async_decode.exp_release_keeps_chain(
+            scheduler_output, plan
+        )
         steady_decode_candidate = (
             self.async_decode.can_attempt_steady_lane_decode_from_scheduler(
                 scheduler_output,
-                decode_layout_changed=plan.decode_layout_changed,
+                decode_layout_changed=(
+                    plan.decode_layout_changed and not release_keeps_chain
+                ),
             )
         )
         if self.async_decode.must_drain_pending_async_steps(
@@ -2955,7 +2964,7 @@ class TTModelRunner:
             "lane scheduler and runner disagreed about decode layout change: "
             f"plan={plan.decode_layout_changed}, applied={layout_changed}"
         )
-        if layout_changed:
+        if layout_changed and not release_keeps_chain:
             self._decode_layout_changed_since_last_decode = True
             if self.async_decode.decode_input_update_contract_version() < 1:
                 self.async_decode.wait_for_all_pending_async_steps()
