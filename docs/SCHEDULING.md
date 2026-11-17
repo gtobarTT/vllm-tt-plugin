@@ -350,6 +350,36 @@ advance. Every lane executes the one negotiated mode, so a per-lane decision
 would let lanes disagree. Standard multi-process DP needs nothing cross-rank:
 each rank runs the policy on its own scheduler state.
 
+### Prefill admission cap
+
+A prompt's first token is sampled when the step that finishes its prefill
+ends. A prefill step admits every waiting prompt that fits, and in lane mode
+every lane prefills in the same step, so a burst of N prompts all get their
+first token at the end of one long step. `max_prefill_requests_per_step`
+(under `additional_config["tt"]`, absent by default, an integer >= 1 when
+set) caps how many *new* requests one prefill step admits, summed over all
+lanes. The others wait for later steps, so each prompt's first token streams
+when its own prefill ends. Total prefill work is unchanged; only the order in
+which prompts finish changes.
+
+- New means taken from `waiting` or `kv_holding_waiting`, so a request resumed
+  after preemption counts. A running partial-prefill continuation does not
+  count and is never held back.
+- Oldest first. In lane mode `TTLaneCoordinator._prefill_admission_caps` merges
+  each lane's ready waiting requests by `Request.arrival_time` and gives each
+  lane a share of the cap (0 is allowed). A request blocked on its grammar, or
+  waiting on a lane with no free slot, gets no share, so the cap is not spent
+  on a request the lane cannot admit this step.
+- `TTScheduler._schedule_prefill_only` applies the share (or, outside lane
+  mode, the configured cap) by lowering `max_num_running_reqs` and
+  `max_num_active_reqs` to what is running plus the cap; vLLM's waiting loop
+  stops there.
+- The share is an upper bound. If a lane's oldest request does not fit (KV
+  pressure), the step admits less, and the zero-token decode fallback applies
+  as before.
+
+Example: `--additional-config '{"tt": {"max_prefill_requests_per_step": 1}}'`.
+
 ### Generic speculative decoding
 
 The generic speculative path uses `speculative_config` and a model's

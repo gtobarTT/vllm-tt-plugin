@@ -22,6 +22,7 @@ from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_decode_interleave_config,
     get_tt_max_batch_size,
+    get_tt_max_prefill_requests_per_step,
     get_tt_output_tokens_per_step,
     get_tt_seeded_sampling_policy,
     get_tt_spec_plan,
@@ -233,6 +234,17 @@ def _validate_and_log_decode_interleave_policy(vllm_config: "VllmConfig") -> Non
         prefill_steps,
         decode_steps,
     )
+
+
+def _validate_and_log_prefill_admission_cap(vllm_config: "VllmConfig") -> None:
+    """Fail here rather than at the first scheduler step in a worker subprocess."""
+    cap = get_tt_max_prefill_requests_per_step(vllm_config)
+    if cap is not None:
+        logger.info(
+            "Prefill admission cap: each prefill step admits at most %d new "
+            "request(s) across all lanes, oldest first.",
+            cap,
+        )
 
 
 def _apply_chunked_prefill_policy(
@@ -2046,6 +2058,7 @@ class TTPlatform(Platform):
         # ``verify_max_model_len`` reads the fields it touches.
         _apply_chunked_prefill_policy(vllm_config, model_capabilities, model_class)
         _validate_and_log_decode_interleave_policy(vllm_config)
+        _validate_and_log_prefill_admission_cap(vllm_config)
         output_tokens_per_step = cls._resolve_output_tokens_per_step(model_class)
         if output_tokens_per_step > 1 and seeded_sampling_policy == "host":
             raise ValueError(

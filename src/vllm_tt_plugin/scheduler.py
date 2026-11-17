@@ -19,6 +19,7 @@ from vllm_tt_plugin.config import (
     get_tt_adaptive_block_max_prompt_tokens,
     get_tt_block_kv_extent_tokens,
     get_tt_decode_interleave_config,
+    get_tt_max_prefill_requests_per_step,
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
     get_tt_spec_plan,
@@ -393,6 +394,12 @@ class TTScheduler(AsyncScheduler):
         # before every one of its lanes' schedule() calls and owns the one
         # policy instance for the whole step, so this one stays dormant there.
         self._decode_interleave = TTDecodeInterleavePolicy(self.vllm_config)
+        self._max_prefill_requests_per_step = get_tt_max_prefill_requests_per_step(
+            self.vllm_config
+        )
+        # Per-step admission cap a lane coordinator sets in place of the
+        # configured one; ``None`` means use ``_max_prefill_requests_per_step``.
+        self._prefill_admission_cap_override: int | None = None
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
         # Block-step decisions for the step currently being committed, read off
         # its SchedulerOutput in update_from_output so _update_request_with_output
@@ -488,6 +495,24 @@ class TTScheduler(AsyncScheduler):
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode
+
+    def set_prefill_admission_cap(self, cap: int | None) -> None:
+        """Override how many new requests a prefill pass may admit.
+
+        Set by ``TTLaneCoordinator`` before each lane's ``schedule()`` call, so
+        the lanes together admit at most the configured total; 0 is valid and
+        lets the lane advance only its partial prefills. ``None`` restores the
+        configured ``max_prefill_requests_per_step``.
+        """
+        if cap is not None and (isinstance(cap, bool) or cap < 0):
+            raise ValueError(f"prefill admission cap must be >= 0, got {cap!r}")
+        self._prefill_admission_cap_override = cap
+
+    def _prefill_admission_cap(self) -> int | None:
+        override = getattr(self, "_prefill_admission_cap_override", None)
+        if override is not None:
+            return override
+        return getattr(self, "_max_prefill_requests_per_step", None)
 
     # Host-only sampling controls and their neutral values: any of these
     # forces the step onto host sampling (check_perform_device_sampling),
@@ -963,15 +988,34 @@ class TTScheduler(AsyncScheduler):
         waiting loop respects the true capacity: the loop admits against
         ``max_num_active_reqs``, and the end-of-step check asserts
         ``max_num_running_reqs``.
+
+        A prefill admission cap lowers both further, to what is already
+        running plus the cap. The waiting loop stops once ``running`` plus the
+        paused streaming sessions reach ``max_num_active_reqs``, so it admits
+        at most ``cap`` requests; the partial prefills it keeps running are
+        scheduled by the running loop, which neither cap limits. A pass that
+        preempts skips the waiting loop entirely, so a preemption cannot open
+        an extra admission.
         """
         pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
         partial_prefills = [r for r in self.running if r.is_prefill_chunk]
 
         saved_max = self.max_num_running_reqs
         saved_active = self.max_num_active_reqs
+        running_cap = max(0, saved_max - len(pure_decodes))
+        active_cap = max(0, saved_active - len(pure_decodes))
+        admission_cap = self._prefill_admission_cap()
+        if admission_cap is not None:
+            running_cap = min(running_cap, len(partial_prefills) + admission_cap)
+            active_cap = min(
+                active_cap,
+                len(partial_prefills)
+                + self.num_waiting_for_streaming_input
+                + admission_cap,
+            )
         self.running = cast(list[Request], partial_prefills)
-        self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
-        self.max_num_active_reqs = max(0, saved_active - len(pure_decodes))
+        self.max_num_running_reqs = running_cap
+        self.max_num_active_reqs = active_cap
         try:
             result = super().schedule()
         finally:

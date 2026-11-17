@@ -655,6 +655,24 @@ def _read_tt_positive_int(tt_config: dict[str, Any], key: str, default: int) -> 
     return value
 
 
+_MAX_PREFILL_REQUESTS_PER_STEP_KEY = "max_prefill_requests_per_step"
+
+
+def get_tt_max_prefill_requests_per_step(vllm_config: "VllmConfig") -> int | None:
+    """Most new requests one prefill step may admit, over all lanes, or ``None``.
+
+    A prompt's first token is sampled when the step that finishes its prefill
+    ends, so a step that prefills twelve prompts delays every one of them by the
+    whole step. The cap admits the oldest waiting requests first and holds the
+    rest for later steps. Partial-prefill continuations are not new requests and
+    are never held back. Absent means no cap.
+    """
+    tt_config = get_tt_config(vllm_config)
+    if _MAX_PREFILL_REQUESTS_PER_STEP_KEY not in tt_config:
+        return None
+    return _read_tt_positive_int(tt_config, _MAX_PREFILL_REQUESTS_PER_STEP_KEY, 1)
+
+
 _LANE_PREFIX_CACHE_ROUTING_KEY = "lane_prefix_cache_routing"
 _LANE_PREFIX_CACHE_ROUTING_DEFAULT = True
 

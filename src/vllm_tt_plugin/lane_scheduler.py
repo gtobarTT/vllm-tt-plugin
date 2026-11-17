@@ -47,6 +47,7 @@ from vllm.v1.request import RequestStatus
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_lane_prefix_cache_routing,
+    get_tt_max_prefill_requests_per_step,
     get_tt_per_lane_max_num_seqs,
 )
 from vllm_tt_plugin.logger import init_tt_logger
@@ -296,6 +297,12 @@ class TTLaneCoordinator(SchedulerInterface):
         # the single negotiated mode, so per-lane instances would each see only
         # their own lane's work and disagree about when to interleave.
         self._decode_interleave = TTDecodeInterleavePolicy(vllm_config)
+        # Total new requests one prefill step may admit across all lanes
+        # (``None``: no cap). Split per lane each step by
+        # ``_prefill_admission_caps``.
+        self._max_prefill_requests_per_step = get_tt_max_prefill_requests_per_step(
+            vllm_config
+        )
 
         # Each lane scheduler must cap its running set at the *per-lane*
         # capacity, not the global ``max_num_seqs`` the coordinator sees. The
@@ -535,8 +542,48 @@ class TTLaneCoordinator(SchedulerInterface):
             return TTSchedulingMode.DECODE_ONLY
         return TTSchedulingMode.from_prefill_intent(intent)
 
+    def _prefill_admission_caps(self, total: int) -> list[int]:
+        """Split ``total`` new admissions across lanes, oldest request first.
+
+        Each lane admits from its own queues in its own order (``kv_holding_waiting``
+        first, then ``waiting``), so a lane's candidates are its ready waiting
+        requests in that order, cut to the slots it has free. The lanes'
+        candidate lists are merged by ``Request.arrival_time`` and the first
+        ``total`` decide each lane's share. A blocked request, or one in a lane
+        with no free slot, is not a candidate: the lane's prefill loop would
+        skip it, and giving it the cap would leave the step short.
+        """
+        candidates: list[list[float]] = []
+        for sched in self.lanes:
+            free = max(
+                0,
+                sched.max_num_active_reqs
+                - len(sched.running)
+                - sched.num_waiting_for_streaming_input,
+            )
+            ready = [
+                req.arrival_time
+                for queue in (sched.kv_holding_waiting, sched.waiting)
+                for req in queue
+                if self._waiting_request_is_ready(sched, req)
+            ]
+            candidates.append(ready[: min(free, total)])
+        caps = [0] * self.num_lanes
+        for _ in range(total):
+            heads = [
+                (arrivals[caps[lane]], lane)
+                for lane, arrivals in enumerate(candidates)
+                if caps[lane] < len(arrivals)
+            ]
+            if not heads:
+                break
+            caps[min(heads)[1]] += 1
+        return caps
+
     def _schedule_all_lanes(
-        self, forced_mode: TTSchedulingMode
+        self,
+        forced_mode: TTSchedulingMode,
+        admission_caps: list[int] | None = None,
     ) -> list[SchedulerOutput]:
         """Run every lane scheduler under ``forced_mode``.
 
@@ -552,12 +599,17 @@ class TTLaneCoordinator(SchedulerInterface):
         whole engine step, and any lane left in ``forced_mode`` is harmless
         because it is overwritten before it is next read. The reset after each
         call simply keeps lanes in a tidy ``DEFAULT`` state between steps.
+        ``admission_caps`` (one per lane) is set and reset the same way.
         """
         lane_outputs: list[SchedulerOutput] = []
-        for sched in self.lanes:
+        for lane, sched in enumerate(self.lanes):
             sched.set_forced_mode(forced_mode)
+            if admission_caps is not None:
+                sched.set_prefill_admission_cap(admission_caps[lane])
             lane_outputs.append(sched.schedule())
             sched.set_forced_mode(TTSchedulingMode.DEFAULT)
+            if admission_caps is not None:
+                sched.set_prefill_admission_cap(None)
         return lane_outputs
 
     # ------------------------------------------------------------------
@@ -680,7 +732,11 @@ class TTLaneCoordinator(SchedulerInterface):
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         prefill_intent = max(self._local_prefill_intent(sched) for sched in self.lanes)
         forced_mode = self._negotiate_forced_mode()
-        lane_outputs = self._schedule_all_lanes(forced_mode)
+        admission_caps = None
+        max_new = getattr(self, "_max_prefill_requests_per_step", None)
+        if forced_mode == TTSchedulingMode.PREFILL_ONLY and max_new is not None:
+            admission_caps = self._prefill_admission_caps(max_new)
+        lane_outputs = self._schedule_all_lanes(forced_mode, admission_caps)
         merged = merge_lane_scheduler_outputs(lane_outputs)
 
         # Decode fallback: a forced prefill step can schedule zero tokens (KV
