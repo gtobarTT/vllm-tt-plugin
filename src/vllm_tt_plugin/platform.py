@@ -1507,12 +1507,14 @@ def _install_tt_prefill_output_flush_patch() -> None:
         if flush is None:
             flush = get_tt_flush_prefill_output(self.vllm_config)
             self._tt_flush_prefill_output = flush
-        if flush and self.batch_queue and is_tt_prefill_step(self.batch_queue[-1][1]):
-            return _publish_oldest_queued_step(self), True
         arrival_wait = self.__dict__.get("_tt_arrival_wait")
         if arrival_wait is None:
             arrival_wait = _ArrivalWait.from_env() or False
             self._tt_arrival_wait = arrival_wait
+        if flush and self.batch_queue and is_tt_prefill_step(self.batch_queue[-1][1]):
+            if arrival_wait:
+                arrival_wait.note_pop(self.batch_queue[-1][1])
+            return _publish_oldest_queued_step(self), True
         if not arrival_wait:
             return original(self)
         oldest = self.batch_queue[-1][1] if self.batch_queue else None
