@@ -290,3 +290,81 @@ def test_the_engine_patch_is_installed_only_when_the_key_is_on(flush):
 
     assert (EngineCore.step_with_batch_queue is not upstream) is flush
     assert hasattr(engine_core, "_tt_original_step_with_batch_queue") is flush
+
+
+# --- Experimental arrival wait (TT_PLUGIN_EXP_ARRIVAL_WAIT_MS) --------------
+
+
+def _steady_decode_engine(monkeypatch, margin_ms):
+    """A single-lane engine in steady decode for A, arrival wait on.
+
+    The fake device runs each step at once, so the measured pop-to-pop
+    intervals are ~0; the wait's state is set as if each decode step took
+    200 ms and the last pop happened just now.
+    """
+    import time
+
+    from vllm_tt_plugin.platform import _ArrivalWait
+
+    monkeypatch.setenv("TT_PLUGIN_EXP_ARRIVAL_WAIT_MS", str(margin_ms))
+    scheduler = _single(**{_KEY: True})
+    scheduler.add_request(_req("A", 1))
+    log = []
+    engine = _engine(scheduler, scheduler.vllm_config, log)
+    engine.input_queue = queue.Queue()
+    engine._handle_client_request = lambda _type, request: scheduler.add_request(
+        request
+    )
+    _drive(engine, log, 6)
+    # One decode step in flight: where the wait applies.
+    assert len(engine.batch_queue) == 1
+    assert ("run", "decode", ("A",)) in log
+    wait = engine._tt_arrival_wait
+    assert isinstance(wait, _ArrivalWait)
+    wait.intervals.clear()
+    wait.intervals.append(0.2)
+    wait.last_pop = time.perf_counter()
+    wait.last_pop_decode = True
+    log.clear()
+    return engine, scheduler, log
+
+
+def test_arrival_wait_schedules_a_request_that_arrives_before_the_deadline(
+    monkeypatch,
+):
+    import threading
+
+    engine, _, log = _steady_decode_engine(monkeypatch, 50)
+    threading.Timer(0.02, engine.input_queue.put, args=((None, _req("C", 2)),)).start()
+    _drive(engine, log, 1)
+
+    # C's prefill takes the slot the next decode step would have had.
+    assert log[0] == ("run", "prefill", ("C",))
+    assert engine._tt_arrival_wait.n_hit == 1
+
+
+def test_arrival_wait_without_a_request_submits_decode_at_the_deadline(monkeypatch):
+    import time
+
+    engine, _, log = _steady_decode_engine(monkeypatch, 50)
+    start = time.perf_counter()
+    _drive(engine, log, 1)
+    waited = time.perf_counter() - start
+
+    # Deadline = last pop + 200 ms - 50 ms margin.
+    assert 0.12 < waited < 0.2
+    assert log[0] == ("run", "decode", ("A",))
+    assert engine._tt_arrival_wait.n_hit == 0
+
+
+def test_arrival_wait_is_skipped_when_a_request_already_waits(monkeypatch):
+    import time
+
+    engine, scheduler, log = _steady_decode_engine(monkeypatch, 50)
+    scheduler.add_request(_req("C", 2))
+    start = time.perf_counter()
+    _drive(engine, log, 1)
+
+    assert time.perf_counter() - start < 0.05
+    assert log[0] == ("run", "prefill", ("C",))
+    assert engine._tt_arrival_wait.n_wait == 0

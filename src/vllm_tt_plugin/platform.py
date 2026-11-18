@@ -1351,6 +1351,115 @@ def _publish_oldest_queued_step(engine) -> dict:
     return outputs
 
 
+class _ArrivalWait:
+    """Experimental (``TT_PLUGIN_EXP_ARRIVAL_WAIT_MS=<margin ms>``, needs
+    ``flush_prefill_output``): hold the next decode submit for a new request.
+
+    In steady decode the batch queue keeps one decode step running on the
+    device and submits the next one at once, so a request that arrives finds a
+    whole decode step queued in front of its prefill. Before scheduling, when
+    the only queued step is a decode step and nothing waits, the engine thread
+    waits on its input queue until shortly before that step should end
+    (last pop + shortest recent decode pop-to-pop interval - margin). A request
+    that arrives in that window is added and scheduled now, so its prefill
+    follows the running step instead of the one after it. Without one, the
+    decode step is scheduled as before, ``margin`` ms before the device needs
+    it. The margin covers schedule + input build + submit.
+    """
+
+    _WINDOW = 32
+    _LOG_EVERY = 2000
+
+    def __init__(self, margin_s: float) -> None:
+        from collections import deque
+
+        self.margin_s = margin_s
+        self.intervals = deque(maxlen=self._WINDOW)
+        self.last_pop: float | None = None
+        self.last_pop_decode = False
+        self.n_wait = 0
+        self.n_hit = 0
+        self.wait_s = 0.0
+        self.n_int = 0
+        self.int_s = 0.0
+
+    @classmethod
+    def from_env(cls) -> "_ArrivalWait | None":
+        raw = os.environ.get("TT_PLUGIN_EXP_ARRIVAL_WAIT_MS", "")
+        if not raw:
+            return None
+        margin_ms = float(raw)
+        logger.info(
+            "Experimental arrival wait: decode submit held for a new request "
+            "until %.1f ms before the running decode step ends.",
+            margin_ms,
+        )
+        return cls(margin_ms / 1000.0)
+
+    @staticmethod
+    def _is_decode(scheduler_output) -> bool:
+        from vllm_tt_plugin.scheduler import is_tt_prefill_step
+
+        return (
+            scheduler_output.total_num_scheduled_tokens > 0
+            and not is_tt_prefill_step(scheduler_output)
+        )
+
+    def before_schedule(self, engine) -> None:
+        import queue
+        import time
+
+        bq = engine.batch_queue
+        if len(bq) != 1 or self.last_pop is None or not self.intervals:
+            return
+        if not self.last_pop_decode or not self._is_decode(bq[-1][1]):
+            return
+        if not engine.input_queue.empty():
+            return
+        if engine.scheduler.get_request_counts()[1] > 0:
+            return
+        start = time.perf_counter()
+        timeout = self.last_pop + min(self.intervals) - self.margin_s - start
+        if timeout < 0.0005:
+            return
+        self.n_wait += 1
+        try:
+            req = engine.input_queue.get(timeout=timeout)
+        except queue.Empty:
+            req = None
+        self.wait_s += time.perf_counter() - start
+        if req is not None:
+            self.n_hit += 1
+            engine._handle_client_request(*req)
+            while not engine.input_queue.empty():
+                engine._handle_client_request(*engine.input_queue.get_nowait())
+        if self.n_wait % self._LOG_EVERY == 0:
+            logger.info(
+                "arrival wait: %d waits, %d with a request, mean wait %.2f ms, "
+                "decode interval min %.2f ms, mean %.2f ms over %d",
+                self.n_wait,
+                self.n_hit,
+                1000.0 * self.wait_s / self.n_wait,
+                1000.0 * min(self.intervals),
+                1000.0 * self.int_s / max(self.n_int, 1),
+                self.n_int,
+            )
+
+    def note_pop(self, scheduler_output) -> None:
+        import time
+
+        now = time.perf_counter()
+        is_decode = self._is_decode(scheduler_output)
+        if is_decode and self.last_pop_decode and self.last_pop is not None:
+            interval = now - self.last_pop
+            if interval < 0.1:
+                self.intervals.append(interval)
+                self.n_int += 1
+                self.int_s += interval
+        self.last_pop = now
+        self.last_pop_decode = is_decode
+
+
 def _install_tt_prefill_output_flush_patch() -> None:
     """Publish a queued TT prefill step's tokens before the next step is scheduled.
 
@@ -1400,7 +1509,19 @@ def _install_tt_prefill_output_flush_patch() -> None:
             self._tt_flush_prefill_output = flush
         if flush and self.batch_queue and is_tt_prefill_step(self.batch_queue[-1][1]):
             return _publish_oldest_queued_step(self), True
-        return original(self)
+        arrival_wait = self.__dict__.get("_tt_arrival_wait")
+        if arrival_wait is None:
+            arrival_wait = _ArrivalWait.from_env() or False
+            self._tt_arrival_wait = arrival_wait
+        if not arrival_wait:
+            return original(self)
+        oldest = self.batch_queue[-1][1] if self.batch_queue else None
+        n_before = len(self.batch_queue)
+        arrival_wait.before_schedule(self)
+        result = original(self)
+        if oldest is not None and len(self.batch_queue) <= n_before:
+            arrival_wait.note_pop(oldest)
+        return result
 
     engine_core.EngineCore.step_with_batch_queue = step_with_batch_queue_tt
 
