@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import math
 from typing import TYPE_CHECKING, Any, Literal
 
 from vllm_tt_plugin.logger import init_tt_logger
@@ -688,6 +689,35 @@ def get_tt_flush_prefill_output(vllm_config: "VllmConfig") -> bool:
     ``False``.
     """
     return _read_tt_bool(get_tt_config(vllm_config), _FLUSH_PREFILL_OUTPUT_KEY, False)
+
+
+_ARRIVAL_WAIT_MS_KEY = "arrival_wait_ms"
+
+
+def get_tt_arrival_wait_ms(vllm_config: "VllmConfig") -> float | None:
+    """Arrival-wait margin in milliseconds, or ``None`` when the wait is off.
+
+    Experimental, needs ``flush_prefill_output``. In steady decode the engine
+    thread holds the next decode submit until this many milliseconds before
+    the running decode step should end, so a request that arrives in that
+    window is scheduled ahead of it. See ``_ArrivalWait`` in ``platform.py``.
+    Absent means off. A finite number >= 0 when set.
+    """
+    tt_config = get_tt_config(vllm_config)
+    if _ARRIVAL_WAIT_MS_KEY not in tt_config:
+        return None
+    value = tt_config[_ARRIVAL_WAIT_MS_KEY]
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError(
+            f"additional_config['tt']['{_ARRIVAL_WAIT_MS_KEY}'] must be a finite "
+            f"number of milliseconds >= 0, got {value!r}"
+        )
+    return float(value)
 
 
 _KEEP_DECODE_CHAIN_KEY = "keep_decode_chain"

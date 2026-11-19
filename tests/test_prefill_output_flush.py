@@ -27,7 +27,11 @@ from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
 from tests.test_block_scheduler import BLOCK_SIZE, _request
 from tests.test_block_scheduler import _scheduler as _real_scheduler
-from vllm_tt_plugin.config import get_tt_flush_prefill_output, store_tt_lane_count
+from vllm_tt_plugin.config import (
+    get_tt_arrival_wait_ms,
+    get_tt_flush_prefill_output,
+    store_tt_lane_count,
+)
 from vllm_tt_plugin.lane_scheduler import TTLaneCoordinator
 from vllm_tt_plugin.platform import _install_tt_prefill_output_flush_patch
 from vllm_tt_plugin.scheduler import TTScheduler
@@ -292,22 +296,66 @@ def test_the_engine_patch_is_installed_only_when_the_key_is_on(flush):
     assert hasattr(engine_core, "_tt_original_step_with_batch_queue") is flush
 
 
-# --- Experimental arrival wait (TT_PLUGIN_EXP_ARRIVAL_WAIT_MS) --------------
+# --- Experimental arrival wait (arrival_wait_ms) ----------------------------
+
+_WAIT_KEY = "arrival_wait_ms"
 
 
-def _steady_decode_engine(monkeypatch, margin_ms):
-    """A single-lane engine in steady decode for A, arrival wait on.
+def test_arrival_wait_is_off_by_default():
+    assert get_tt_arrival_wait_ms(_config()) is None
 
-    The fake device runs each step at once, so the measured pop-to-pop
-    intervals are ~0; the wait's state is set as if each decode step took
-    200 ms and the last pop happened just now.
+
+@pytest.mark.parametrize("value", [0, 8, 2.5])
+def test_arrival_wait_reads_a_non_negative_number_of_ms(value):
+    margin = get_tt_arrival_wait_ms(_config(**{_WAIT_KEY: value}))
+
+    assert margin == value
+    assert isinstance(margin, float)
+
+
+@pytest.mark.parametrize(
+    "value", [-1, -0.5, float("nan"), float("inf"), "8", True, None]
+)
+def test_invalid_arrival_wait_values_raise(value):
+    with pytest.raises(ValueError, match=_WAIT_KEY):
+        get_tt_arrival_wait_ms(_config(**{_WAIT_KEY: value}))
+
+
+@pytest.mark.parametrize("flush", [None, False])
+def test_arrival_wait_without_flush_fails_at_startup(flush):
+    from vllm_tt_plugin.platform import _install_prefill_output_flush_if_requested
+
+    tt_keys = {_WAIT_KEY: 8} if flush is None else {_WAIT_KEY: 8, _KEY: flush}
+    upstream = EngineCore.step_with_batch_queue
+    with pytest.raises(ValueError, match=rf"{_WAIT_KEY}.*{_KEY}"):
+        _install_prefill_output_flush_if_requested(_config(**tt_keys))
+    assert EngineCore.step_with_batch_queue is upstream
+
+
+def test_arrival_wait_with_flush_validates_at_startup():
+    from vllm_tt_plugin.platform import _install_prefill_output_flush_if_requested
+
+    with pytest.raises(ValueError, match=_WAIT_KEY):
+        _install_prefill_output_flush_if_requested(
+            _config(**{_KEY: True, _WAIT_KEY: -1})
+        )
+
+
+def _steady_decode_engine(monkeypatch, margin_ms, **tt_keys):
+    """A single-lane engine in steady decode for A, flush on.
+
+    The arrival wait is on when ``margin_ms`` is not None. The fake device runs
+    each step at once, so the measured pop-to-pop intervals are ~0; the wait's
+    state is set as if each decode step took 200 ms and the last pop happened
+    just now.
     """
     import time
 
     from vllm_tt_plugin.platform import _ArrivalWait
 
-    monkeypatch.setenv("TT_PLUGIN_EXP_ARRIVAL_WAIT_MS", str(margin_ms))
-    scheduler = _single(**{_KEY: True})
+    if margin_ms is not None:
+        tt_keys[_WAIT_KEY] = margin_ms
+    scheduler = _single(**{_KEY: True}, **tt_keys)
     scheduler.add_request(_req("A", 1))
     log = []
     engine = _engine(scheduler, scheduler.vllm_config, log)
@@ -320,6 +368,10 @@ def _steady_decode_engine(monkeypatch, margin_ms):
     assert len(engine.batch_queue) == 1
     assert ("run", "decode", ("A",)) in log
     wait = engine._tt_arrival_wait
+    if margin_ms is None:
+        assert wait is False
+        log.clear()
+        return engine, scheduler, log
     assert isinstance(wait, _ArrivalWait)
     wait.intervals.clear()
     wait.intervals.append(0.2)
@@ -368,3 +420,14 @@ def test_arrival_wait_is_skipped_when_a_request_already_waits(monkeypatch):
     assert time.perf_counter() - start < 0.05
     assert log[0] == ("run", "prefill", ("C",))
     assert engine._tt_arrival_wait.n_wait == 0
+
+
+def test_without_the_key_decode_is_submitted_at_once(monkeypatch):
+    import time
+
+    engine, _, log = _steady_decode_engine(monkeypatch, None)
+    start = time.perf_counter()
+    _drive(engine, log, 1)
+
+    assert time.perf_counter() - start < 0.05
+    assert log[0] == ("run", "decode", ("A",))

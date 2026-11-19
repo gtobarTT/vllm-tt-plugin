@@ -18,6 +18,7 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 
 from vllm_tt_plugin.config import (
     TT_WORKER_CLS,
+    get_tt_arrival_wait_ms,
     get_tt_config,
     get_tt_data_parallel_size,
     get_tt_decode_interleave_config,
@@ -301,8 +302,19 @@ def _validate_and_log_keep_decode_chain(
 
 
 def _install_prefill_output_flush_if_requested(vllm_config: "VllmConfig") -> None:
-    """Validate ``flush_prefill_output`` here; install the engine patch when on."""
-    if not get_tt_flush_prefill_output(vllm_config):
+    """Validate ``flush_prefill_output`` and ``arrival_wait_ms`` here; install
+    the engine patch when the flush is on."""
+    flush = get_tt_flush_prefill_output(vllm_config)
+    arrival_wait_ms = get_tt_arrival_wait_ms(vllm_config)
+    if arrival_wait_ms is not None and not flush:
+        # The wait lives in the flush patch; without it the key would do
+        # nothing.
+        raise ValueError(
+            "additional_config['tt']['arrival_wait_ms']="
+            f"{arrival_wait_ms!r} needs additional_config['tt']"
+            f"['flush_prefill_output']=true; got flush_prefill_output={flush!r}."
+        )
+    if not flush:
         return
     _install_tt_prefill_output_flush_patch()
     logger.info(
@@ -1404,8 +1416,8 @@ def _publish_oldest_queued_step(engine) -> dict:
 
 
 class _ArrivalWait:
-    """Experimental (``TT_PLUGIN_EXP_ARRIVAL_WAIT_MS=<margin ms>``, needs
-    ``flush_prefill_output``): hold the next decode submit for a new request.
+    """Experimental (``arrival_wait_ms``, needs ``flush_prefill_output``): hold
+    the next decode submit for a new request.
 
     In steady decode the batch queue keeps one decode step running on the
     device and submits the next one at once, so a request that arrives finds a
@@ -1436,11 +1448,10 @@ class _ArrivalWait:
         self.int_s = 0.0
 
     @classmethod
-    def from_env(cls) -> "_ArrivalWait | None":
-        raw = os.environ.get("TT_PLUGIN_EXP_ARRIVAL_WAIT_MS", "")
-        if not raw:
+    def from_config(cls, vllm_config: "VllmConfig") -> "_ArrivalWait | None":
+        margin_ms = get_tt_arrival_wait_ms(vllm_config)
+        if margin_ms is None:
             return None
-        margin_ms = float(raw)
         logger.info(
             "Experimental arrival wait: decode submit held for a new request "
             "until %.1f ms before the running decode step ends.",
@@ -1561,7 +1572,7 @@ def _install_tt_prefill_output_flush_patch() -> None:
             self._tt_flush_prefill_output = flush
         arrival_wait = self.__dict__.get("_tt_arrival_wait")
         if arrival_wait is None:
-            arrival_wait = _ArrivalWait.from_env() or False
+            arrival_wait = _ArrivalWait.from_config(self.vllm_config) or False
             self._tt_arrival_wait = arrival_wait
         if flush and self.batch_queue and is_tt_prefill_step(self.batch_queue[-1][1]):
             if arrival_wait:
