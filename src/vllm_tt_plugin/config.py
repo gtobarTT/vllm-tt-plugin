@@ -690,6 +690,25 @@ def get_tt_flush_prefill_output(vllm_config: "VllmConfig") -> bool:
     return _read_tt_bool(get_tt_config(vllm_config), _FLUSH_PREFILL_OUTPUT_KEY, False)
 
 
+_KEEP_DECODE_CHAIN_KEY = "keep_decode_chain"
+
+
+def get_tt_keep_decode_chain(vllm_config: "VllmConfig") -> bool:
+    """Whether a lane decode step that only frees slots keeps the resident chain.
+
+    Experimental. Under async scheduling in lane mode, a decode step whose only
+    layout change is a finished request's freed slot otherwise drains the
+    pipeline and reloads every input from the host, and the reloading step is
+    never overlap-ok. ``True`` keeps the device-resident token chain across
+    such a release and lets the next steady step overlap a plain
+    device-sampled reloading decode. See
+    ``TTAsyncDecodeController.exp_release_keeps_chain``. Startup refuses it
+    without async scheduling, lane mode and on-device sampling. Default
+    ``False``.
+    """
+    return _read_tt_bool(get_tt_config(vllm_config), _KEEP_DECODE_CHAIN_KEY, False)
+
+
 _LANE_PREFIX_CACHE_ROUTING_KEY = "lane_prefix_cache_routing"
 _LANE_PREFIX_CACHE_ROUTING_DEFAULT = True
 

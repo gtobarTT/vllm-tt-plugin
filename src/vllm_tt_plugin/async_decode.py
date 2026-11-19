@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 from collections import Counter
@@ -28,13 +27,10 @@ from vllm_tt_plugin.spec_decode import (
 from vllm_tt_plugin.stage_outputs import TTStageFrame, pop_tt_stage_outputs
 from vllm_tt_plugin.structured_output import has_structured_outputs
 
-# EXPERIMENTAL switches, opt-in, approved for one tt-ops experiment. Unset keeps
-# upstream behaviour.
-# TT_PLUGIN_EXP_KEEP_CHAIN=1: a lane decode step whose only layout change is
-# freed slots keeps the device-resident token chain (no input reload, no
-# pipeline drain), and a reloading decode step may be overlapped by the next
-# steady step.
-_EXP_KEEP_CHAIN = os.environ.get("TT_PLUGIN_EXP_KEEP_CHAIN", "0") == "1"
+# Experimental ``keep_decode_chain`` (see ``get_tt_keep_decode_chain``): a lane
+# decode step whose only layout change is freed slots keeps the device-resident
+# token chain (no input reload, no pipeline drain), and a reloading decode step
+# may be overlapped by the next steady step. Off unless the key is set.
 # A freed slot that keeps the resident chain keeps advancing its position on
 # the device; force a reload before it gets this close to the position limit.
 _EXP_FREED_POS_MARGIN = 128
@@ -394,8 +390,9 @@ class AsyncTTSpecDecodeOutput(DeferredDecodeOutput):
 class TTAsyncDecodeController:
     """Own the TT async decode lifecycle for a `TTModelRunner`."""
 
-    def __init__(self, runner: TTModelRunner):
+    def __init__(self, runner: TTModelRunner, *, keep_decode_chain: bool = False):
         self.runner = runner
+        self._keep_decode_chain = keep_decode_chain
         # Decode residency is committed at submission, not readback. During
         # overlapped device sampling the host can intentionally remain one step
         # behind, so submitted-device history is the only safe reload authority.
@@ -417,7 +414,7 @@ class TTAsyncDecodeController:
         # count the scheduler's lookahead reservation rather than a verify.
         self._ordinary_decode_submissions = 0
         self._verify_submissions = 0
-        # Experimental counters and state (see _EXP_KEEP_CHAIN).
+        # Experimental counters and state (see exp_release_keeps_chain).
         self._exp_release_keeps = 0
         self._exp_reload_overlaps = 0
         # Steps a freed-but-resident slot may still advance before its device
@@ -812,7 +809,7 @@ class TTAsyncDecodeController:
                 self._verify_submissions,
                 self._overlapped_submissions,
             )
-            if _EXP_KEEP_CHAIN:
+            if self._keep_decode_chain:
                 logger.info(
                     "TT exp: releases kept resident %d, reload steps "
                     "marked overlap-ok %d, unsafe overlaps %d",
@@ -1345,9 +1342,8 @@ class TTAsyncDecodeController:
         )
         return step
 
-    @staticmethod
-    def _exp_reload_step_overlap_ok(model_input: TTModelInput) -> bool:
-        if not _EXP_KEEP_CHAIN:
+    def _exp_reload_step_overlap_ok(self, model_input: TTModelInput) -> bool:
+        if not self._keep_decode_chain:
             return False
         return (
             model_input.spec_mode is None
@@ -1360,7 +1356,7 @@ class TTAsyncDecodeController:
         self, scheduler_output: SchedulerOutput, plan: Any
     ) -> bool:
         """Whether a lane decode step whose layout change only frees slots can
-        keep the device-resident chain (experimental, TT_PLUGIN_EXP_KEEP_CHAIN).
+        keep the device-resident chain (experimental, ``keep_decode_chain``).
 
         Called before ``apply_step_plan`` mutates the batch. The surviving
         slots keep their stable rows and their resident tokens and positions,
@@ -1373,7 +1369,11 @@ class TTAsyncDecodeController:
         ``_exp_freed_budget`` bounds the steps until the next reload (at most
         ``_EXP_FREED_MAX_STEPS``, less near the position limit).
         """
-        if not _EXP_KEEP_CHAIN or not plan.is_decode or not plan.decode_layout_changed:
+        if (
+            not self._keep_decode_chain
+            or not plan.is_decode
+            or not plan.decode_layout_changed
+        ):
             return False
         runner = self.runner
         if (

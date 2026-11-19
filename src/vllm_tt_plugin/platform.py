@@ -22,6 +22,7 @@ from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_decode_interleave_config,
     get_tt_flush_prefill_output,
+    get_tt_keep_decode_chain,
     get_tt_max_batch_size,
     get_tt_max_prefill_requests_per_step,
     get_tt_output_tokens_per_step,
@@ -246,6 +247,57 @@ def _validate_and_log_prefill_admission_cap(vllm_config: "VllmConfig") -> None:
             "request(s) across all lanes, oldest first.",
             cap,
         )
+
+
+def _validate_and_log_keep_decode_chain(
+    vllm_config: "VllmConfig",
+    *,
+    is_lane_mode: bool,
+    sample_on_device_mode: str | None,
+) -> None:
+    """Refuse ``keep_decode_chain`` where its path can never run.
+
+    Runs after the model gate on async scheduling and the lane fold. The kept
+    release is only taken on a lane decode step
+    (``TTModelRunner._execute_lane_step``), only after a device-sampled decode
+    (``exp_release_keeps_chain`` reads ``_previous_device_sampling``), and the
+    reloading-step overlap only on an async lane submission
+    (``submit_async_lane_decode``). It was measured only under async
+    scheduling.
+    """
+    if not get_tt_keep_decode_chain(vllm_config):
+        return
+    missing = []
+    if not vllm_config.scheduler_config.async_scheduling:
+        missing.append(
+            "async scheduling (resolved async_scheduling="
+            f"{vllm_config.scheduler_config.async_scheduling!r}; the model must "
+            "declare model_capabilities['supports_async_decode'])"
+        )
+    if not is_lane_mode:
+        missing.append(
+            "lane mode (TT data-parallel lanes folded into one engine; "
+            f"lanes={get_tt_data_parallel_size(vllm_config)}, "
+            "data_parallel_size="
+            f"{vllm_config.parallel_config.data_parallel_size})"
+        )
+    if sample_on_device_mode is None:
+        missing.append(
+            "on-device decode sampling (sample_on_device_mode 'all' or "
+            "'decode_only'; got None)"
+        )
+    if missing:
+        raise ValueError(
+            "additional_config['tt']['keep_decode_chain']=true needs "
+            + "; ".join(missing)
+            + ". Without them the kept chain is never taken. Unset the key or "
+            "change the launch."
+        )
+    logger.info(
+        "Experimental keep_decode_chain: a lane decode step that only frees "
+        "slots keeps the device-resident chain, and a reloading decode step "
+        "may be overlapped by the next steady step."
+    )
 
 
 def _install_prefill_output_flush_if_requested(vllm_config: "VllmConfig") -> None:
@@ -2800,6 +2852,11 @@ class TTPlatform(Platform):
             vllm_config, model_capabilities, model_class, is_lane_mode
         )
         validate_tt_scheduler_config(vllm_config)
+        _validate_and_log_keep_decode_chain(
+            vllm_config,
+            is_lane_mode=is_lane_mode,
+            sample_on_device_mode=sample_on_device_mode,
+        )
         if tt_requests_cannot_resume(vllm_config):
             _install_block_output_reset_abort_patch()
             _install_block_output_pause_guard_patch()

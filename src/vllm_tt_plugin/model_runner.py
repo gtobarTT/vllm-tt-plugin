@@ -43,6 +43,7 @@ from vllm_tt_plugin.async_decode import (
 )
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
+    get_tt_keep_decode_chain,
     get_tt_max_batch_size,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
@@ -443,7 +444,9 @@ class TTModelRunner:
         self._pending_async_steps: deque[DeferredDecodeOutput] = deque()
         self._pending_async_overlap_ok: deque[bool] = deque()
         self._completed_decode_steps: deque[CompletedDecodeStep] = deque()
-        self.async_decode = TTAsyncDecodeController(self)
+        self.async_decode = TTAsyncDecodeController(
+            self, keep_decode_chain=get_tt_keep_decode_chain(vllm_config)
+        )
         self.tt_data_parallel_size = get_tt_data_parallel_size(vllm_config)
         self.tt_max_batch_size = get_tt_max_batch_size(vllm_config)
         self.tt_per_lane_max_num_seqs = get_tt_per_lane_max_num_seqs(vllm_config)
@@ -2929,7 +2932,7 @@ class TTModelRunner:
             )
 
         lane_batch = self.lane_batch
-        # Experimental (TT_PLUGIN_EXP_KEEP_CHAIN): a decode step that only
+        # Experimental (keep_decode_chain): a decode step that only
         # frees slots keeps the resident chain; see exp_release_keeps_chain.
         if self.async_decode.exp_freed_budget_exhausted():
             self._decode_layout_changed_since_last_decode = True
