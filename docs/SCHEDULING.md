@@ -418,6 +418,31 @@ step function holds outputs back.
 
 Example: `--additional-config '{"tt": {"flush_prefill_output": true}}'`.
 
+### Arrival wait (experimental)
+
+In steady async decode the batch queue keeps one decode step running on the
+device and submits the next one at once, so a request that arrives finds a
+whole decode step queued ahead of its prefill. `arrival_wait_ms` (under
+`additional_config["tt"]`, absent by default, a finite number of milliseconds
+>= 0 when set) holds that submit:
+
+- Before scheduling, when the only queued step is a decode step, the step
+  popped before it was a decode step too, and no request waits, the engine
+  thread waits on its input queue until `arrival_wait_ms`
+  before the running step should end. The end is estimated as the last pop
+  plus the shortest of the last 32 decode pop-to-pop intervals.
+- A request that arrives in that window is added and scheduled at once, so its
+  prefill follows the running step instead of the step after it. Otherwise the
+  decode step is scheduled as before, `arrival_wait_ms` before the device needs
+  it. The margin covers schedule, input build and submit.
+- The wait is part of the prefill output flush patch (`_ArrivalWait` in
+  `platform.py`). Startup raises when the key is set without
+  `flush_prefill_output: true`, or when the value is negative, NaN, infinite
+  or not a number.
+
+Example: `--additional-config '{"tt": {"flush_prefill_output": true,
+"arrival_wait_ms": 8}}'`.
+
 ### Generic speculative decoding
 
 The generic speculative path uses `speculative_config` and a model's
@@ -782,6 +807,35 @@ lane, so the engine's global capacity becomes `N * M`.
 
 Lane-DP does not currently support request-specific RoPE state, including mRoPE
 vision models.
+
+### Keeping the decode chain across slot releases (experimental)
+
+Under async scheduling a lane decode step whose only layout change is a
+finished request's freed slot counts as a layout transition: pending async
+decode work is drained and every decode input is reloaded from the host. A
+reloading step is never overlap-safe, so the step after it drains too.
+`keep_decode_chain` (under `additional_config["tt"]`, boolean, default `false`)
+changes both:
+
+- A release of finished requests only keeps the device-resident token chain
+  (`TTAsyncDecodeController.exp_release_keeps_chain`). The surviving slots keep
+  their stable rows. The freed slot's page-table row is zeroed by the same
+  step, so its writes land in the null block, and its output is never read.
+  The freed slot is reloaded at the next input reload, at the latest after 32
+  steps and earlier near the position limit, because its attention still costs
+  device time. Preemption and resume keep the drain.
+- Late outputs, for a released request, of steps submitted before the release
+  are suppressed until no such step can still be applied.
+- A decode that reloaded its inputs is overlap-ok, so the next steady step can
+  be submitted over it, when it is a lane decode that is not a verify, is
+  sampled on device without deferral, and returns no logprobs
+  (`_exp_reload_step_overlap_ok`).
+
+Startup raises when the key is on without async scheduling (including when
+the model gate turns it off), outside lane mode, or without on-device decode
+sampling (`sample_on_device_mode` `all` or `decode_only`). The kept release
+also needs a model on decode reload contract version 1 or later
+(`decode_input_update_contract`); an older adapter keeps the drain.
 
 ### Speculation in lane mode
 
